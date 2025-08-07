@@ -16,10 +16,18 @@ def create_lef( mem ):
     depth       = mem.depth
     bits        = mem.width_in_bits
     banks       = mem.num_banks
-    w           = mem.width_um 
+    w           = snap_to_grid(mem.width_um, mem.process.manufacturing_grid_um)
     h           = mem.height_um
-    num_rwport  = mem.rw_ports
+    # num_rwport  = mem.rw_ports
+    num_rports  = mem.r    
+    num_wports  = mem.w
+    num_rwports = mem.rw    
+    num_wmasks  = mem.wmask
+    has_wmask   = mem.has_write_mask
+
     addr_width  = math.ceil(math.log2(mem.depth))
+    number_of_lpins = 0
+    number_of_rpins = 0
 
     # Process parameters
     min_pin_width   = mem.process.pin_width_um
@@ -27,35 +35,81 @@ def create_lef( mem ):
     manufacturing_grid_um = mem.process.manufacturing_grid_um
     metal_prefix     = mem.process.metal_prefix
     metal_layer      = mem.process.metal_layer
+
+    r_portside     = mem.r_portside
+    w_portside     = mem.w_portside
+    rw_portside    = mem.rw_portside
+
+    # Unused
     column_mux_factor = mem.process.column_mux_factor
  
     # Offset from bottom edge to first pin
-    x_offset = 1 * min_pin_pitch   ;# as told by MSK 
-    y_offset = 1 * min_pin_pitch   ;# as told by MSK 
+    x_offset = snap_to_grid(1 * min_pin_pitch, manufacturing_grid_um)
+    y_offset = snap_to_grid(1 * min_pin_pitch, manufacturing_grid_um)
+        
     #########################################
     # Calculate the pin spacing (pitch)
     #########################################
-    # rd_out (#bits) + wd_in (#bits) + addr_in (#addr_width) + we_in/ce_in/clk
-    number_of_pins = 2*bits + addr_width + 3
+    num_wmasks = num_wmasks if has_wmask else 0
+
+    # Read ports: each has bits (data in) + addr_width (address in) + 2 control pins    
+    # Write ports: each has bits (data in) + addr_width (address in) + 3 control pins
+    # Read/Write ports: each has bits (data out) + bits (data in) + addr_width + 3 control pins
+
+    # We calculate number of total of left/right pins 
+    # then take max(number_of_rpins, number_of_lpins)
+    # to be equal to number_of_pins
+
+    number_of_lpins += (num_wports * (bits + addr_width + 3))    + num_wmasks if w_portside == "left" else 0
+    number_of_lpins += (num_rwports * (2*bits + addr_width + 3)) + num_wmasks if rw_portside == "left" else 0
+    number_of_lpins += (num_rports * (bits + addr_width + 2)) if r_portside == "left" else 0 
+    
+    number_of_rpins += (num_wports * (bits + addr_width + 3))    + num_wmasks if w_portside == "right" else 0
+    number_of_rpins += (num_rwports * (2*bits + addr_width + 3)) + num_wmasks if rw_portside == "right" else 0
+    number_of_rpins += (num_rports * (bits + addr_width + 2)) if r_portside == "right" else 0 
+
+    # count number of tracks, height - y offset top/bottom divided by pin pitch
     number_of_tracks_available = math.floor((h - 2*y_offset) / min_pin_pitch)
+
+    # Crucial for height, take out reduntant height by counting pins
+    number_of_pins = max(number_of_rpins, number_of_lpins)
+
     number_of_spare_tracks = number_of_tracks_available - number_of_pins
 
     if number_of_spare_tracks < 0:
-        print("Error: not enough tracks (num pins: %d, available tracks: %d)." % (number_of_pins, number_of_tracks_available))
+        print("Error: not enough tracks for %s (num pins: %d, available tracks: %d)." % (name, number_of_pins, number_of_tracks_available))
         sys.exit(1)
 
-    ## The next few lines of code till "pin_pitch = min.." spreads the pins in higher multiples of pin pitch if there are available tracks
-    track_count = 1
-    while number_of_spare_tracks > 0:
-        track_count += 1
-        number_of_spare_tracks = number_of_tracks_available - number_of_pins*track_count
-    track_count -= 1
+    track_count = max(1, number_of_tracks_available // number_of_pins)
 
-    pin_pitch = min_pin_pitch * track_count
-    # Divide by the remaining 'spare' tracks into the inter-group spaces
-    #  [4 groups -> 3 spaces]
-    extra = math.floor((number_of_tracks_available - number_of_pins*track_count) / 3)
-    group_pitch = extra*mem.process.pin_pitch_um
+    # Should ENSURE snaps to grid otherwise errors
+    pin_pitch = snap_to_grid(min_pin_pitch * track_count, manufacturing_grid_um)
+
+    total_groups = (num_rwports * 3) + (num_rports + num_wports) * 2 
+    remaining_tracks = number_of_tracks_available - (number_of_pins * track_count)
+    if total_groups > 0:
+        extra_tracks_per_group = remaining_tracks // total_groups
+        group_pitch = snap_to_grid(extra_tracks_per_group * min_pin_pitch, manufacturing_grid_um)
+    else:
+        group_pitch = snap_to_grid(min_pin_pitch, manufacturing_grid_um)
+
+
+    y_max_required = 2 * y_offset                 # Top and bottom offsets
+    y_max_required += number_of_pins * pin_pitch  # Space for all pins
+    y_max_required += total_groups * group_pitch  # Space for group separations
+
+    if y_max_required != h:
+        if y_max_required > h:
+            print(f"Expanding height: {h:.3f} -> {y_max_required:.3f} (needed more space)")
+        else:
+            print(f"Shrinking height: {h:.3f} -> {y_max_required:.3f} (removing excess space)")
+        
+        h = snap_to_grid(y_max_required, manufacturing_grid_um)
+        print('Snapped to grid: ', h)
+        mem.height_um = h  # Update mem object for lef_add_pin bounds checking
+    else:
+        print(f"Height unchanged: {h:.3f} (perfect fit)")
+
     #########################################
     # LEF HEADER
     #########################################
@@ -78,25 +132,16 @@ def create_lef( mem ):
     fid.write('  CLASS BLOCK ;\n')
 
     ########################################
-    # LEF SIGNAL PINS
+    # DYNAMIC LEF SIGNAL PINS
     ########################################
 
-    y_step = y_offset - (y_offset % manufacturing_grid_um) + (mem.process.pin_width_um/2.0)
-    for i in range(int(bits)) :
-        y_step = lef_add_pin( fid, mem, 'rd_out[%d]'%i, False, y_step, pin_pitch )
-
-    y_step += group_pitch
-    for i in range(int(bits)) :
-        y_step = lef_add_pin( fid, mem, 'wd_in[%d]'%i, True, y_step, pin_pitch )
-
-    y_step += group_pitch
-    for i in range(int(addr_width)) :
-        y_step = lef_add_pin( fid, mem, 'addr_in[%d]'%i, True, y_step, pin_pitch )
-
-    y_step += group_pitch
-    y_step = lef_add_pin( fid, mem, 'we_in', True, y_step, pin_pitch )
-    y_step = lef_add_pin( fid, mem, 'ce_in', True, y_step, pin_pitch )
-    y_step = lef_add_pin( fid, mem, 'clk',   True, y_step, pin_pitch )
+    initial_y = snap_to_grid(y_offset, manufacturing_grid_um) + (mem.process.pin_width_um/2.0)
+    left_y_step = initial_y
+    right_y_step = initial_y
+    
+    left_y_step, right_y_step = r_write_lef( fid, mem, num_rports , left_y_step, right_y_step, pin_pitch, bits, addr_width, group_pitch)
+    left_y_step, right_y_step = w_write_lef( fid, mem, num_wports , left_y_step, right_y_step, pin_pitch, bits, addr_width, has_wmask, num_wmasks, group_pitch)
+    left_y_step, right_y_step = rw_write_lef(fid, mem, num_rwports, left_y_step, right_y_step, pin_pitch, bits, addr_width, has_wmask, num_wmasks, group_pitch)
 
     ########################################
     # Create VDD/VSS Strapes
@@ -104,11 +149,10 @@ def create_lef( mem ):
 
     supply_pin_width = min_pin_width*4
     supply_pin_half_width = supply_pin_width/2
-    supply_pin_pitch = min_pin_pitch*8
-    #supply_pin_layer = '%s' % metal_layer
+    supply_pin_pitch = snap_to_grid(min_pin_pitch*8, manufacturing_grid_um)
 
     ## Create supply pins  : HOW'RE we ensuring that supply pins don't overlap with the signal pins ? Is it by giving x_offset as the base x coordinate ?
-    y_step = y_offset
+    y_step = snap_to_grid(y_offset, manufacturing_grid_um)
     fid.write('  PIN VSS\n')
     fid.write('    DIRECTION INOUT ;\n')
     fid.write('    USE GROUND ;\n')
@@ -120,7 +164,7 @@ def create_lef( mem ):
     fid.write('    END\n')
     fid.write('  END VSS\n')
 
-    y_step = y_offset + supply_pin_pitch
+    y_step = snap_to_grid(y_offset + supply_pin_pitch, manufacturing_grid_um)
     fid.write('  PIN VDD\n')
     fid.write('    DIRECTION INOUT ;\n')
     fid.write('    USE POWER ;\n')
@@ -152,10 +196,14 @@ def create_lef( mem ):
     fid.write('END LIBRARY\n')
     fid.close()
 
-#
-# Helper function that adds a signal pin
-# y_step = lef_add_pin( fid, mem, 'w_mask_in[%d]'%i, True, y_step, pin_pitch )
-def lef_add_pin( fid, mem, pin_name, is_input, y, pitch ):
+########################################
+# Helper Functions
+########################################
+def lef_add_pin( fid, mem, pin_name, is_input, y, pitch, right_side ) -> float:
+  y = snap_to_grid(y, mem.process.manufacturing_grid_um)
+  if y + mem.process.pin_width_um/2 > mem.height_um:
+      print(f"ERROR: Pin {pin_name} exceeds macro height!")
+      sys.exit(1)
 
   layer = mem.process.metal_layer
   pw  = mem.process.pin_width_um
@@ -167,8 +215,148 @@ def lef_add_pin( fid, mem, pin_name, is_input, y, pitch ):
   fid.write('    SHAPE ABUTMENT ;\n')
   fid.write('    PORT\n')
   fid.write('      LAYER %s ;\n' % layer)
-  fid.write('      RECT %.3f %.3f %.3f %.3f ;\n' % (0, y-hpw, pw, y+hpw))
+  
+  if right_side:
+    # fid.write('      RECT %.3f %.3f %.3f %.3f ;\n' % (mem.width_um-pw, y-hpw, mem.width_um, y+hpw))
+    # # Right side: start from right edge, extend inward
+    fid.write('      RECT %.3f %.3f %.3f %.3f ;\n' % (mem.width_um-pw, y-hpw, mem.width_um, y+hpw))
+  else:
+    fid.write('      RECT %.3f %.3f %.3f %.3f ;\n' % (0, y-hpw, pw, y+hpw))
+  
   fid.write('    END\n')
   fid.write('  END %s\n' % pin_name)
-  
+
   return y + pitch
+
+def r_write_lef(fid, mem, num_rports, left_y_step, right_y_step, pin_pitch, bits, addr_width, group_pitch) -> float:
+
+    for i in range(num_rports):
+        is_right_side = mem.r_portside == 'right'
+        current_y = right_y_step if is_right_side else left_y_step
+        
+        # Address in
+        for j in range(int(addr_width)) :
+            current_y = lef_add_pin( fid, mem, 'r%d_addr_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+    
+        # Read data out
+        for j in range(int(bits)) :
+            current_y = lef_add_pin( fid, mem, 'r%d_rd_out[%d]'%(i,j), False, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+
+        # current_y = lef_add_pin( fid, mem, 'r%d_we_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'r%d_ce_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'r%d_clk'%i,   True, current_y, pin_pitch, is_right_side )
+
+        if is_right_side:
+            right_y_step = current_y + pin_pitch
+        else:
+            left_y_step = current_y + pin_pitch
+
+    return left_y_step, right_y_step
+
+def w_write_lef(fid, mem, num_wports, left_y_step, right_y_step, pin_pitch, bits, addr_width, has_wmask, num_wmask, group_pitch) -> float:
+
+    for i in range(num_wports):
+        is_right_side = mem.w_portside == 'right'
+        current_y = right_y_step if is_right_side else left_y_step
+        
+        # Address in
+        for j in range(int(addr_width)) :
+            current_y = lef_add_pin( fid, mem, 'w%d_addr_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+
+        # Write data in
+        for j in range(int(bits)) :
+            current_y = lef_add_pin( fid, mem, 'w%d_wd_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+
+        if has_wmask:
+            for j in range(int(num_wmask)):
+                current_y = lef_add_pin( fid, mem, 'w%d_wmask_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+            current_y += group_pitch           
+
+        current_y = lef_add_pin( fid, mem, 'w%d_we_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'w%d_ce_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'w%d_clk'%i,   True, current_y, pin_pitch, is_right_side )
+
+        if is_right_side:
+            right_y_step = current_y + pin_pitch
+        else:
+            left_y_step = current_y + pin_pitch
+
+    return left_y_step, right_y_step
+
+def rw_write_lef(fid, mem, num_rwports, left_y_step, right_y_step, pin_pitch, bits, addr_width, has_wmask, num_wmask, group_pitch) -> float:
+
+    for i in range(num_rwports):
+        is_right_side = mem.rw_portside == 'right'
+        current_y = right_y_step if is_right_side else left_y_step
+    
+        # Address in
+        for j in range(int(addr_width)) :
+            current_y = lef_add_pin( fid, mem, 'rw%d_addr_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+    
+        # Write data in
+        for j in range(int(bits)) :
+            current_y = lef_add_pin( fid, mem, 'rw%d_wd_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+    
+        # Read data out
+        for j in range(int(bits)) :
+            current_y = lef_add_pin( fid, mem, 'rw%d_rd_out[%d]'%(i,j), False, current_y, pin_pitch, is_right_side )
+        current_y += group_pitch
+
+        if has_wmask:
+            for j in range(int(num_wmask)):
+                current_y = lef_add_pin( fid, mem, 'rw%d_wmask_in[%d]'%(i,j), True, current_y, pin_pitch, is_right_side )
+            current_y += group_pitch           
+
+        current_y = lef_add_pin( fid, mem, 'rw%d_we_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'rw%d_ce_in'%i, True, current_y, pin_pitch, is_right_side )
+        current_y = lef_add_pin( fid, mem, 'rw%d_clk'%i,   True, current_y, pin_pitch, is_right_side )
+
+        if is_right_side:
+            right_y_step = current_y + pin_pitch
+        else:
+            left_y_step = current_y + pin_pitch
+
+    return left_y_step, right_y_step
+
+def snap_to_grid(value, grid) -> float:
+    """Snap a value to the nearest manufacturing grid point"""
+    return round(value / grid) * grid
+
+
+# """ Testing """
+# if __name__ == '__main__':
+#     class MockProcess:
+#         pin_width_um = 0.2
+#         pin_pitch_um = 0.4
+#         # Mock sky130
+#         manufacturing_grid_um = 5
+#         metal_prefix = "met"
+#         metal_layer = "met2"
+#         column_mux_factor = 1
+
+#     class MockMem:
+#         name = "test_sram"
+#         depth = 256
+#         width_in_bits = 32
+#         num_banks = 1
+#         width_um = 20.0
+#         height_um = 40.0
+#         r = 1
+#         w = 1
+#         rw = 1
+#         wmask = 4
+#         has_write_mask = True
+#         r_portside = "left"
+#         w_portside = "right"
+#         rw_portside = "left"
+#         process = MockProcess()
+#         results_dir = "."
+    
+#     mem = MockMem()
+#     create_lef(mem)

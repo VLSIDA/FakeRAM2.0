@@ -25,7 +25,6 @@ class Process:
     self.fin_pitch_nm = int(json_data['fin_pitch_nm'])
     self.manufacturing_grid_nm = int(json_data['manufacturing_grid_nm'])
     self.column_mux_factor = int(json_data['column_mux_factor'])
-    
     # Optional keys
     self.snap_width_nm   = int(json_data['snap_width_nm']) if 'snap_width_nm' in json_data else 1
     self.snap_height_nm  = int(json_data['snap_height_nm']) if 'snap_height_nm' in json_data else 1
